@@ -1,0 +1,285 @@
+import requests
+import pandas as pd
+import numpy as np
+import datetime as dt
+import time
+import math
+import logging
+import json
+import os
+import sys
+
+# =========================
+# CONFIG
+# =========================
+ACCESS_TOKEN = ""
+BASE_URL = "https://api.upstox.com/v2"
+
+SYMBOL = "NSE_EQ|INE0GGX23010"
+INTERVAL = "1minute"
+
+FAST_EMA = 20
+SLOW_EMA = 40
+ATR_LEN = 14
+ADX_LEN = 14
+
+STOP_ATR = 2.5
+TAKE_ATR = 5
+
+INITIAL_CAPITAL = 2000
+RISK_PER_TRADE = 0.005
+MAX_DAILY_DRAWDOWN = 0.02
+
+STATE_FILE = "engine_state.json"
+
+# =========================
+# LOGGING
+# =========================
+logging.basicConfig(
+    filename="prod_trading.log",
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+
+headers = {
+    "Authorization": f"Bearer {ACCESS_TOKEN}",
+    "Accept": "application/json"
+}
+
+# =========================
+# STATE MANAGEMENT
+# =========================
+def load_state():
+    today = dt.date.today().isoformat()
+
+    if os.path.exists(STATE_FILE):
+        with open(STATE_FILE, "r") as f:
+            state = json.load(f)
+
+        # Reset daily loss if new day
+        if state.get("date") != today:
+            state["daily_loss"] = 0
+            state["date"] = today
+            save_state(state)
+
+        return state
+
+    return {
+        "capital": INITIAL_CAPITAL,
+        "position": 0,
+        "entry_price": None,
+        "daily_loss": 0,
+        "date": today
+    }
+
+def save_state(state):
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f)
+
+state = load_state()
+
+# =========================
+# SAFE API REQUEST
+# =========================
+def safe_request(url, params=None):
+
+    try:
+        r = requests.get(url, headers=headers, params=params, timeout=10)
+    except Exception as e:
+        raise Exception(f"Connection error: {e}")
+
+    if r.status_code != 200:
+        raise Exception(f"HTTP {r.status_code}: {r.text}")
+
+    try:
+        data = r.json()
+    except:
+        raise Exception(f"Invalid JSON: {r.text}")
+
+    if "data" not in data:
+        raise Exception(f"Unexpected API structure: {data}")
+
+    return data
+
+# =========================
+# HISTORICAL PRELOAD
+# =========================
+def preload_history():
+
+    to_date = dt.datetime.now().strftime("%Y-%m-%d")
+    from_date = (dt.datetime.now() - dt.timedelta(days=5)).strftime("%Y-%m-%d")
+
+    url = f"{BASE_URL}/historical-candle/{SYMBOL}/{INTERVAL}/{to_date}/{from_date}"
+
+    data = safe_request(url)
+
+    if "candles" not in data["data"]:
+        raise Exception(f"No candles in response: {data}")
+
+    candles = data["data"]["candles"]
+
+    if len(candles) < 50:
+        raise Exception("Not enough historical candles returned.")
+
+    df = pd.DataFrame(
+        candles,
+        columns=["time","open","high","low","close","volume","oi"]
+    )
+
+    df["time"] = pd.to_datetime(df["time"])
+    df = df.sort_values("time").reset_index(drop=True)
+
+    return df
+
+# =========================
+# INDICATORS
+# =========================
+def compute_indicators(df):
+
+    df['ema_fast'] = df['close'].ewm(span=FAST_EMA, adjust=False).mean()
+    df['ema_slow'] = df['close'].ewm(span=SLOW_EMA, adjust=False).mean()
+
+    tr1 = df['high'] - df['low']
+    tr2 = abs(df['high'] - df['close'].shift())
+    tr3 = abs(df['low'] - df['close'].shift())
+    df['tr'] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+    df['atr'] = df['tr'].rolling(ATR_LEN).mean()
+
+    # ADX
+    up_move = df['high'].diff()
+    down_move = -df['low'].diff()
+
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+
+    atr_safe = df['atr'].replace(0, np.nan)
+
+    plus_di = 100 * (pd.Series(plus_dm).rolling(ADX_LEN).mean() / atr_safe)
+    minus_di = 100 * (pd.Series(minus_dm).rolling(ADX_LEN).mean() / atr_safe)
+
+    dx = 100 * (abs(plus_di - minus_di) / (plus_di + minus_di))
+
+    df['adx'] = dx.rolling(ADX_LEN).mean()
+
+    return df
+
+# =========================
+# ORDER EXECUTION
+# =========================
+def place_order(side, qty):
+
+    url = f"{BASE_URL}/order/place"
+
+    payload = {
+        "instrument_key": SYMBOL,
+        "transaction_type": side,
+        "quantity": int(qty),
+        "order_type": "MARKET",
+        "product": "D",
+        "validity": "DAY"
+    }
+
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=10)
+    except Exception as e:
+        logging.error(f"Order connection error: {e}")
+        return False
+
+    if r.status_code != 200:
+        logging.error(f"Order failed: {r.text}")
+        return False
+
+    logging.info(f"Order success: {r.text}")
+    return True
+
+# =========================
+# MARKET HOURS
+# =========================
+def market_open():
+    now = dt.datetime.now()
+    start = now.replace(hour=9, minute=15, second=0, microsecond=0)
+    end = now.replace(hour=15, minute=30, second=0, microsecond=0)
+    return start <= now <= end
+
+# =========================
+# ENGINE LOOP
+# =========================
+print("Engine started...")
+
+while True:
+
+    if not market_open():
+        time.sleep(30)
+        continue
+
+    try:
+        df = preload_history()
+        df = compute_indicators(df)
+
+        latest = df.iloc[-1]
+        prev = df.iloc[-2]
+
+        # Skip if indicators not ready
+        if np.isnan(latest['adx']) or np.isnan(latest['atr']):
+            time.sleep(60)
+            continue
+
+        # Daily drawdown guard
+        if state["daily_loss"] >= INITIAL_CAPITAL * MAX_DAILY_DRAWDOWN:
+            logging.warning("Daily drawdown hit. Stopping.")
+            sys.exit()
+
+        # Regime filter
+        if latest['adx'] < 20:
+            time.sleep(60)
+            continue
+
+        # ENTRY
+        if state["position"] == 0:
+            if prev['ema_fast'] < prev['ema_slow'] and latest['ema_fast'] > latest['ema_slow']:
+
+                stop = latest['close'] - STOP_ATR * latest['atr']
+                risk_per_share = latest['close'] - stop
+
+                if risk_per_share <= 0:
+                    time.sleep(60)
+                    continue
+
+                risk_amount = state["capital"] * RISK_PER_TRADE
+                qty = math.floor(risk_amount / risk_per_share)
+
+                if qty > 0:
+                    if place_order("BUY", qty):
+                        state["position"] = qty
+                        state["entry_price"] = latest['close']
+                        save_state(state)
+
+        # EXIT
+        elif state["position"] > 0:
+
+            entry = state["entry_price"]
+            stop = entry - STOP_ATR * latest['atr']
+            take = entry + TAKE_ATR * latest['atr']
+
+            if (latest['low'] <= stop or
+                latest['high'] >= take or
+                latest['ema_fast'] < latest['ema_slow']):
+
+                if place_order("SELL", state["position"]):
+
+                    pnl = (latest['close'] - entry) * state["position"]
+                    state["capital"] += pnl
+
+                    if pnl < 0:
+                        state["daily_loss"] += abs(pnl)
+
+                    state["position"] = 0
+                    state["entry_price"] = None
+                    save_state(state)
+
+        time.sleep(60)
+
+    except Exception as e:
+        logging.error(f"Engine error: {e}")
+        time.sleep(10)
